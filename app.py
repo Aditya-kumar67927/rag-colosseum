@@ -1,7 +1,6 @@
 
 import json
 import re
-import threading
 from pathlib import Path
 
 import numpy as np
@@ -10,8 +9,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from sentence_transformers import SentenceTransformer
-
+from fastembed import TextEmbedding
 
 # --------------------------------------------------
 # CONFIGURATION
@@ -32,7 +30,7 @@ ABSTAIN_THRESHOLD = 0.34
 SENTENCE_THRESHOLD = 0.28
 
 # Protect against simultaneous model access.
-MODEL_LOCK = threading.Lock()
+
 
 
 # --------------------------------------------------
@@ -66,13 +64,10 @@ class QueryRequest(BaseModel):
 # --------------------------------------------------
 # GLOBAL VARIABLES
 # --------------------------------------------------
-
 model = None
 passages = []
 passage_embeddings = None
 passage_ids = []
-
-
 # --------------------------------------------------
 # KNOWLEDGE BASE LOADER
 # --------------------------------------------------
@@ -140,9 +135,20 @@ def load_knowledge_base():
 # MODEL INITIALIZATION
 # --------------------------------------------------
 
+
+def encode_texts(texts):
+    """Generate normalized embeddings using FastEmbed."""
+    vectors = np.asarray(
+        list(model.embed(texts, batch_size=16)),
+        dtype=np.float32
+    )
+
+    norms = np.linalg.norm(vectors, axis=1, keepdims=True)
+    return vectors / np.maximum(norms, 1e-12)
+
+
 @app.on_event("startup")
 def initialize():
-
     global model
     global passages
     global passage_embeddings
@@ -154,18 +160,16 @@ def initialize():
 
     print("Loaded passages:", len(passages))
 
-    print("Loading embedding model...")
+    print("Loading FastEmbed ONNX model...")
 
-    model = SentenceTransformer(MODEL_NAME)
+    model = TextEmbedding(
+        model_name=MODEL_NAME,
+        threads=1
+    )
 
     print("Generating passage embeddings...")
 
-    with MODEL_LOCK:
-        passage_embeddings = model.encode(
-            passages,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )
+    passage_embeddings = encode_texts(passages)
 
     print("RAG system ready!")
 
@@ -200,27 +204,19 @@ def is_suspicious_sentence(sentence):
 # SEMANTIC RETRIEVAL
 # --------------------------------------------------
 
-def retrieve(question, top_k):
 
-    with MODEL_LOCK:
-        query_embedding = model.encode(
-            [question],
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )[0]
+def retrieve(query_embedding, top_k):
 
     similarities = np.dot(
         passage_embeddings,
         query_embedding
     )
 
-    # Return original 0-based passage indices.
     ranked_indices = np.argsort(similarities)[::-1][:top_k]
 
     results = []
 
     for index in ranked_indices:
-
         score = float(similarities[index])
 
         results.append({
@@ -236,32 +232,46 @@ def retrieve(question, top_k):
 # SENTENCE EXTRACTION
 # --------------------------------------------------
 
-def extract_supporting_sentences(question, results):
 
+def extract_supporting_sentences(question, query_embedding, results):
+    """Select evidence using semantic, passage, and keyword relevance."""
+    stop_words = {
+        "what", "which", "who", "when", "where", "does", "do",
+        "is", "are", "the", "a", "an", "and", "or", "of",
+        "to", "for", "in", "on", "use", "uses", "used",
+        "with", "how", "much", "many"
+    }
+    question_terms = {
+        word.lower()
+        for word in re.findall(r"[a-zA-Z0-9]+", question)
+        if word.lower() not in stop_words
+    }
     sentences = []
-
     for passage in results:
-
-        parts = re.split(
-            r"(?<=[.!?])\s+",
-            passage["text"]
-        )
-
+        parts = re.split(r"(?<=[.!?])\s+", passage["text"])
         for sentence in parts:
-
             sentence = sentence.strip()
-
-            if len(sentence) < 10:
+            if len(sentence) < 10 or is_suspicious_sentence(sentence):
                 continue
 
-            # Do not execute or repeat suspicious instructions.
-            if is_suspicious_sentence(sentence):
-                continue
+            sentence_terms = {
+                word.lower()
+                for word in re.findall(r"[a-zA-Z0-9]+", sentence)
+            }
+            overlap = sum(
+                1
+                for term in question_terms
+                if term in sentence_terms
+                or term + "s" in sentence_terms
+                or term + "es" in sentence_terms
+            )
+            lexical_score = overlap / max(len(question_terms), 1)
 
             sentences.append({
                 "text": sentence,
                 "passage_index": passage["index"],
-                "passage_score": passage["score"]
+                "passage_score": passage["score"],
+                "lexical_score": lexical_score
             })
 
     if not sentences:
@@ -271,26 +281,19 @@ def extract_supporting_sentences(question, results):
         item["text"] for item in sentences
     ]
 
-    with MODEL_LOCK:
-        sentence_embeddings = model.encode(
-            sentence_texts,
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )
+    sentence_embeddings = encode_texts(sentence_texts)
 
-        query_embedding = model.encode(
-            [question],
-            normalize_embeddings=True,
-            convert_to_numpy=True
-        )[0]
-
-    sentence_scores = np.dot(
+    semantic_scores = np.dot(
         sentence_embeddings,
         query_embedding
     )
 
-    for item, score in zip(sentences, sentence_scores):
-        item["sentence_score"] = float(score)
+    for item, score in zip(sentences, semantic_scores):
+        item["sentence_score"] = (
+            0.25 * float(score)
+            + 0.65 * item["passage_score"]
+            + 0.1 * item["lexical_score"]
+        )
 
     sentences.sort(
         key=lambda item: item["sentence_score"],
@@ -299,15 +302,14 @@ def extract_supporting_sentences(question, results):
 
     selected = []
 
-    # Keep the strongest distinct supporting sentences.
     for item in sentences:
-
         if item["sentence_score"] < SENTENCE_THRESHOLD:
             continue
 
-        if item["text"] in [
-            existing["text"] for existing in selected
-        ]:
+        if any(
+            existing["text"] == item["text"]
+            for existing in selected
+        ):
             continue
 
         selected.append(item)
@@ -322,7 +324,7 @@ def extract_supporting_sentences(question, results):
 # ANSWER GENERATION
 # --------------------------------------------------
 
-def generate_answer(question, results):
+def generate_answer(question, query_embedding, results):
 
     if not results:
         return None, [], 0.0
@@ -332,6 +334,7 @@ def generate_answer(question, results):
 
     evidence = extract_supporting_sentences(
         question,
+        query_embedding,
         results
     )
 
@@ -400,13 +403,16 @@ def query(request: QueryRequest):
             detail="Question cannot be empty"
         )
 
+    query_embedding = encode_texts([question])[0]
+
     results = retrieve(
-        question,
+        query_embedding,
         request.top_k
     )
 
     answer, used_sources, confidence = generate_answer(
         question,
+        query_embedding,
         results
     )
 

@@ -1,5 +1,6 @@
 
 import json
+import math
 import re
 from pathlib import Path
 
@@ -28,6 +29,25 @@ MAX_TOP_K = 5
 # using the actual 20-question challenge.
 ABSTAIN_THRESHOLD = 0.34
 SENTENCE_THRESHOLD = 0.28
+QUERY_EXPANSIONS = {
+    "sgd": "stochastic gradient descent"
+}
+CONCEPT_ALIASES = {
+    "sgd": "stochastic gradient descent",
+    "stochastic gradient descent": "stochastic gradient descent",
+    "adamw": "adamw",
+    "raft": "raft",
+    "postgres": "postgresql",
+    "postgresql": "postgresql",
+    "mysql": "mysql"
+}
+STOP_WORDS = {
+    "what", "which", "who", "when", "where", "does", "do",
+    "is", "are", "the", "a", "an", "and", "or", "of",
+    "to", "for", "in", "on", "use", "uses", "used",
+    "with", "how", "much", "many", "compare", "between",
+    "versus", "vs"
+}
 
 # Protect against simultaneous model access.
 
@@ -200,29 +220,167 @@ def is_suspicious_sentence(sentence):
     )
 
 
+def expand_query(question):
+    expanded_question = question
+
+    for abbreviation, expansion in QUERY_EXPANSIONS.items():
+        expanded_question = re.sub(
+            rf"\b{re.escape(abbreviation)}\b",
+            expansion,
+            expanded_question,
+            flags=re.IGNORECASE
+        )
+
+    return expanded_question
+
+
+def normalize_term(word):
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith("es"):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s"):
+        return word[:-1]
+    return word
+
+
+def get_terms(text):
+    terms = set()
+    for word in re.findall(r"[a-zA-Z0-9]+", text.lower()):
+        if word in STOP_WORDS:
+            continue
+        term = normalize_term(word)
+        if term not in STOP_WORDS:
+            terms.add(term)
+    return terms
+
+
+def get_term_weights(question):
+    question_terms = get_terms(expand_query(question))
+    if not question_terms:
+        return {}
+
+    document_frequencies = {}
+    for passage in passages:
+        for term in get_terms(passage):
+            document_frequencies[term] = (
+                document_frequencies.get(term, 0) + 1
+            )
+
+    document_count = max(len(passages), 1)
+    return {
+        term: 1.0 + math.log(
+            (document_count + 1)
+            / (document_frequencies.get(term, 0) + 1)
+        )
+        for term in question_terms
+    }
+
+
+def lexical_relevance(text, term_weights):
+    if not term_weights:
+        return 0.0
+
+    text_terms = get_terms(text)
+    matched_weight = sum(
+        weight
+        for term, weight in term_weights.items()
+        if term in text_terms
+    )
+    return matched_weight / sum(term_weights.values())
+
+
+def get_question_concepts(question):
+    concepts = []
+    for alias, concept in CONCEPT_ALIASES.items():
+        if (
+            concept not in concepts
+            and re.search(
+                rf"\b{re.escape(alias)}\b",
+                question,
+                flags=re.IGNORECASE
+            )
+        ):
+            concepts.append(concept)
+    return concepts
+
+
+def get_fact_groups(question):
+    terms = get_terms(expand_query(question))
+    fact_groups = []
+
+    if "batch" in terms or "size" in terms:
+        fact_groups.append({"batch", "size", "sample", "example"})
+    if "learning" in terms or "rate" in terms:
+        fact_groups.append({"learning", "rate"})
+    if "port" in terms:
+        fact_groups.append({"port"})
+
+    return fact_groups
+
+
 # --------------------------------------------------
 # SEMANTIC RETRIEVAL
 # --------------------------------------------------
 
 
-def retrieve(query_embedding, top_k):
+def retrieve(question, query_embedding, top_k):
 
     similarities = np.dot(
         passage_embeddings,
         query_embedding
     )
 
-    ranked_indices = np.argsort(similarities)[::-1][:top_k]
+    term_weights = get_term_weights(question)
+    passage_scores = []
+    for passage, similarity in zip(passages, similarities):
+        semantic_score = max(0.0, min(1.0, float(similarity)))
+        lexical_score = lexical_relevance(passage, term_weights)
+        passage_scores.append(
+            0.65 * semantic_score + 0.35 * lexical_score
+        )
+
+    ranked_indices = np.argsort(passage_scores)[::-1].tolist()
+    concepts = get_question_concepts(question)
+    concept_indices = []
+    for concept in concepts:
+        matching_indices = [
+            index
+            for index, passage in enumerate(passages)
+            if concept in passage.lower()
+        ]
+        if matching_indices:
+            concept_indices.append(
+                max(
+                    matching_indices,
+                    key=lambda index: passage_scores[index]
+                )
+            )
+
+    if concept_indices:
+        selected_indices = concept_indices[:top_k]
+    else:
+        selected_indices = ranked_indices[:top_k]
+
+    if len(concept_indices) > 1 and len(selected_indices) < top_k:
+        for index in ranked_indices:
+            if index not in selected_indices:
+                selected_indices.append(index)
+            if len(selected_indices) == top_k:
+                break
+
+    selected_indices.sort(
+        key=lambda index: passage_scores[index],
+        reverse=True
+    )
 
     results = []
 
-    for index in ranked_indices:
-        score = float(similarities[index])
-
+    for index in selected_indices:
         results.append({
             "index": int(passage_ids[index]),
             "text": passages[index],
-            "score": max(0.0, min(1.0, score))
+            "score": passage_scores[index]
         })
 
     return results
@@ -235,17 +393,7 @@ def retrieve(query_embedding, top_k):
 
 def extract_supporting_sentences(question, query_embedding, results):
     """Select evidence using semantic, passage, and keyword relevance."""
-    stop_words = {
-        "what", "which", "who", "when", "where", "does", "do",
-        "is", "are", "the", "a", "an", "and", "or", "of",
-        "to", "for", "in", "on", "use", "uses", "used",
-        "with", "how", "much", "many"
-    }
-    question_terms = {
-        word.lower()
-        for word in re.findall(r"[a-zA-Z0-9]+", question)
-        if word.lower() not in stop_words
-    }
+    term_weights = get_term_weights(question)
     sentences = []
     for passage in results:
         parts = re.split(r"(?<=[.!?])\s+", passage["text"])
@@ -254,24 +402,11 @@ def extract_supporting_sentences(question, query_embedding, results):
             if len(sentence) < 10 or is_suspicious_sentence(sentence):
                 continue
 
-            sentence_terms = {
-                word.lower()
-                for word in re.findall(r"[a-zA-Z0-9]+", sentence)
-            }
-            overlap = sum(
-                1
-                for term in question_terms
-                if term in sentence_terms
-                or term + "s" in sentence_terms
-                or term + "es" in sentence_terms
-            )
-            lexical_score = overlap / max(len(question_terms), 1)
-
             sentences.append({
                 "text": sentence,
                 "passage_index": passage["index"],
                 "passage_score": passage["score"],
-                "lexical_score": lexical_score
+                "lexical_score": lexical_relevance(sentence, term_weights)
             })
 
     if not sentences:
@@ -290,15 +425,70 @@ def extract_supporting_sentences(question, query_embedding, results):
 
     for item, score in zip(sentences, semantic_scores):
         item["sentence_score"] = (
-            0.25 * float(score)
-            + 0.65 * item["passage_score"]
-            + 0.1 * item["lexical_score"]
+            0.45 * max(0.0, min(1.0, float(score)))
+            + 0.25 * item["passage_score"]
+            + 0.3 * item["lexical_score"]
         )
 
     sentences.sort(
         key=lambda item: item["sentence_score"],
         reverse=True
     )
+
+    concepts = get_question_concepts(question)
+    if len(concepts) > 1:
+        selected = []
+        fact_groups = get_fact_groups(question)
+        for concept in concepts:
+            concept_passages = [
+                passage
+                for passage in results
+                if concept in passage["text"].lower()
+            ]
+            if not concept_passages:
+                continue
+
+            target_index = max(
+                concept_passages,
+                key=lambda passage: passage["score"]
+            )["index"]
+            passage_sentences = [
+                item for item in sentences
+                if item["passage_index"] == target_index
+            ]
+            concept_sentences = [
+                item for item in passage_sentences
+                if item["sentence_score"] >= SENTENCE_THRESHOLD
+            ]
+
+            if fact_groups:
+                for fact_group in fact_groups:
+                    matching_sentences = [
+                        item for item in passage_sentences
+                        if get_terms(item["text"]) & fact_group
+                    ]
+                    numeric_sentences = [
+                        item for item in matching_sentences
+                        if re.search(
+                            r"(?<![A-Za-z0-9])\d+(?:\.\d+)?",
+                            item["text"]
+                        )
+                    ]
+                    if numeric_sentences:
+                        matching_sentences = numeric_sentences
+                    if matching_sentences:
+                        selected.append(max(
+                            matching_sentences,
+                            key=lambda item: item["sentence_score"]
+                        ))
+            else:
+                selected.extend(concept_sentences[:3])
+
+        if selected:
+            return list({
+                item["text"]: item
+                for item in selected
+            }.values())
 
     selected = []
 
@@ -403,9 +593,18 @@ def query(request: QueryRequest):
             detail="Question cannot be empty"
         )
 
-    query_embedding = encode_texts([question])[0]
+    if is_suspicious_sentence(question):
+        return {
+            "answer": None,
+            "sources": [],
+            "scores": [],
+            "confidence": 0.1
+        }
+
+    query_embedding = encode_texts([expand_query(question)])[0]
 
     results = retrieve(
+        question,
         query_embedding,
         request.top_k
     )
